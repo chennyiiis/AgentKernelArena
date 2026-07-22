@@ -21,6 +21,7 @@ kernel with the task's own compile/correctness/performance commands.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -510,8 +511,8 @@ def _reap_workspace_orphans(workspace: str, logger: logging.Logger) -> int:
 
 def _run_streamed(
     cmd: str, workspace: str, env: dict, timeout_seconds: int, logger: logging.Logger
-) -> str:
-    """Run a shell command, stream stdout/stderr to the logger, return combined output.
+) -> tuple[str, int]:
+    """Run a shell command and return its combined output and exit code.
 
     Terminates then force-kills the process on timeout. Shared by the forge-loop
     and forge-rewrite launch paths.
@@ -590,7 +591,52 @@ def _run_streamed(
     output = "\n".join(stdout_lines)
     if stderr_lines:
         output += "\n=== STDERR ===\n" + "\n".join(stderr_lines)
-    return output
+    return output, int(process.returncode if process.returncode is not None else -1)
+
+
+def _source_hashes(paths: list[Path]) -> dict[str, str]:
+    """Hash the editable task sources to detect a no-op Forge result."""
+    return {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in paths
+        if path.exists() and path.is_file()
+    }
+
+
+def _read_forge_result(result_json: Path) -> dict[str, Any]:
+    if not result_json.is_file():
+        raise RuntimeError(f"Forge did not write result JSON: {result_json}")
+    try:
+        result = json.loads(result_json.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid Forge result JSON: {exc}") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("Forge result JSON must be an object")
+    return result
+
+
+def _validate_forge_outcome(
+    *,
+    result_json: Path,
+    return_code: int,
+    before_hashes: dict[str, str] | None = None,
+    source_files: list[Path] | None = None,
+) -> dict[str, Any]:
+    """Reject transport failures and unchanged-source pseudo optimizations."""
+    result = _read_forge_result(result_json)
+    status = str(result.get("status") or "")
+    if return_code != 0 or result.get("success") is False:
+        reason = status or result.get("termination_reason") or "unknown"
+        raise RuntimeError(
+            f"Forge subprocess failed (exit={return_code}, reason={reason})"
+        )
+    if before_hashes is not None and source_files is not None:
+        after_hashes = _source_hashes(source_files)
+        if before_hashes == after_hashes:
+            raise RuntimeError(
+                "Forge produced no effective source changes; refusing optimized scoring"
+            )
+    return result
 
 
 def _driver_shapes(driver_path: Path) -> list:
@@ -697,10 +743,16 @@ def _launch_forge_rewrite(
     logger.info("=" * 80)
 
     timeout_seconds = int(agent_config.get("timeout_seconds", 3600))
-    output = _run_streamed(cmd, workspace, env, timeout_seconds, logger)
+    output, return_code = _run_streamed(
+        cmd, workspace, env, timeout_seconds, logger
+    )
 
     # Restore the working tree to the best-kept FlyDSL kernel before Arena scores.
     _git(workspace, "checkout", "--", ".", logger=logger)
+    _validate_forge_outcome(
+        result_json=result_json,
+        return_code=return_code,
+    )
     return output
 
 
@@ -809,6 +861,7 @@ def launch_agent(eval_config: dict[str, Any], task_config_dir: str, workspace: s
 
     experiments_dir = Path(workspace) / "forge_experiments"
     result_json = experiments_dir / "forge_result.json"
+    source_hashes_before = _source_hashes(all_source_files)
 
     model = str(agent_config.get("model", "claude-opus-4-8"))
     permission_mode = str(agent_config.get("permission_mode", "acceptEdits"))
@@ -886,10 +939,18 @@ def launch_agent(eval_config: dict[str, Any], task_config_dir: str, workspace: s
     logger.info("=" * 80)
 
     timeout_seconds = int(agent_config.get("timeout_seconds", 3600))
-    output = _run_streamed(cmd, workspace, env, timeout_seconds, logger)
+    output, return_code = _run_streamed(
+        cmd, workspace, env, timeout_seconds, logger
+    )
 
     # Restore the workspace working tree to the loop's final (best-kept) state.
     # The loop runs on the 'forge-optimize' branch; ensure no partial/uncommitted
     # revert leaves the tree dirty before Arena re-scores.
     _git(workspace, "checkout", "--", ".", logger=logger)
+    _validate_forge_outcome(
+        result_json=result_json,
+        return_code=return_code,
+        before_hashes=source_hashes_before,
+        source_files=all_source_files,
+    )
     return output
