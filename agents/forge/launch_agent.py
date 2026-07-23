@@ -64,14 +64,14 @@ def _forge_max_hours(agent_config: dict[str, Any]) -> float:
     """Derive the forge-loop ``--max-hours`` budget from the run's timeout.
 
     ``timeout_seconds`` is the single time budget (the API/bootstrap patches it
-    per-run, e.g. 115200 for a 32h run). ``--max-hours`` tracks it with a small
-    margin so the loop self-stops (BUDGET EXHAUSTED) just before the hard
-    process-wait kill instead of being killed mid-iteration. A fixed hours value
-    would ignore the per-run timeout and cap long runs early (a 32h run would
-    stop at ~8h). The default timeout (29700s) yields ~8h.
+    per-run, e.g. 115200 for a 32h run). ``--max-hours`` leaves a 30-minute
+    finalization margin so the deadline-aware loop can cancel an active Claude
+    session, restore the last KEEP, run Arena's final evaluator, package the
+    workspace, and upload artifacts before the hard process-wait kill. A fixed
+    hours value would ignore the per-run timeout and cap long runs early.
     """
     timeout_s = float(agent_config.get("timeout_seconds", 3600))
-    return round(max(0.1, timeout_s / 3600.0 - 0.25), 3)
+    return round(max(0.1, timeout_s / 3600.0 - 0.5), 3)
 
 
 def _repo_subdir_name(task_config: dict[str, Any]) -> str | None:

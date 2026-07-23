@@ -3,6 +3,7 @@ import json
 import pytest
 
 from agents.forge.launch_agent import (
+    _forge_max_hours,
     _source_hashes,
     _validate_forge_outcome,
 )
@@ -16,6 +17,11 @@ def _result(path, **overrides):
     }
     value.update(overrides)
     path.write_text(json.dumps(value))
+
+
+def test_forge_max_hours_reserves_finalization_window():
+    assert _forge_max_hours({"timeout_seconds": 43200}) == 11.5
+    assert _forge_max_hours({"timeout_seconds": 3600}) == 0.5
 
 
 def test_validate_forge_outcome_rejects_nonzero_exit(tmp_path):
